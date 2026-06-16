@@ -1,5 +1,5 @@
 const STORE_KEY = 'fitjourney_state_v1';
-const API_URL = '/fitness-api.php';
+const API_URL = '/api/fitness';
 
 const todayKey = () => new Date().toISOString().slice(0, 10);
 const uid = () => `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -538,6 +538,7 @@ function bindEvents() {
       arms: '',
       thighs: '',
       chest: '',
+      timestamp: new Date().toISOString(),
     }];
     state.activeTab = 'dashboard';
     saveState();
@@ -547,7 +548,7 @@ function bindEvents() {
   document.getElementById('progressForm')?.addEventListener('submit', (event) => {
     event.preventDefault();
     const data = Object.fromEntries(new FormData(event.currentTarget));
-    state.progress.push({ id: uid(), ...data });
+    state.progress.push({ id: uid(), ...data, timestamp: new Date().toISOString() });
     state.profile.weight = data.weight;
     saveState();
     render();
@@ -612,7 +613,7 @@ function bindEvents() {
     try {
       const upload = new FormData();
       upload.append('video', file);
-      const response = await fetch('/upload-video.php', { method: 'POST', body: upload });
+      const response = await fetch('/api/upload-video', { method: 'POST', body: upload });
       const json = await response.json();
       serverUrl = json.url || '';
     } catch {}

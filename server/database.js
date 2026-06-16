@@ -1,122 +1,165 @@
-import { existsSync } from "node:fs";
-import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { seedData } from "./data/seed.js";
+import sqlite3Pkg from 'sqlite3';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { mkdir } from 'node:fs/promises';
 
+const sqlite3 = sqlite3Pkg.verbose();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-export const dataDir = process.env.NQ_DATA_DIR
-  ? path.resolve(process.env.NQ_DATA_DIR)
-  : path.join(__dirname, "data");
+const dataDir = path.resolve(__dirname, '..', 'fitness-data');
+const dbPath = path.join(dataDir, 'fitness.sqlite');
 
-export const databasePath = process.env.NQ_DB_FILE
-  ? path.resolve(process.env.NQ_DB_FILE)
-  : path.join(dataDir, "database.json");
+let db = null;
 
-const defaultSettings = {
-  numQuestions: 15,
-  hintsEnabled: true,
-  timeLimit: 0,
-  passingScore: 60,
-  recommendationThreshold: 70,
-};
-
-let cache = null;
-let writeQueue = Promise.resolve();
-
-const clone = (value) => JSON.parse(JSON.stringify(value));
-
-function currentTimestamp() {
-  return new Date().toISOString();
-}
-
-function normalizeObject(value) {
-  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
-}
-
-function normalizeDatabase(value = {}) {
-  const meta = normalizeObject(value.meta);
-  const now = currentTimestamp();
-
-  return {
-    questions: Array.isArray(value.questions)
-      ? value.questions
-      : clone(seedData.questions || []),
-    settings: {
-      ...defaultSettings,
-      ...normalizeObject(seedData.settings),
-      ...normalizeObject(value.settings),
-    },
-    attempts: Array.isArray(value.attempts) ? value.attempts : [],
-    qStats: normalizeObject(value.qStats),
-    users: Array.isArray(value.users) ? value.users : [],
-    phoneOtps: Array.isArray(value.phoneOtps) ? value.phoneOtps : [],
-    meta: {
-      version: 1,
-      createdAt: meta.createdAt || now,
-      updatedAt: meta.updatedAt || now,
-    },
-  };
-}
-
-async function persistDatabase(value) {
-  await mkdir(dataDir, { recursive: true });
-  const normalized = normalizeDatabase(value);
-  normalized.meta.updatedAt = currentTimestamp();
-
-  const tmpPath = `${databasePath}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(tmpPath, `${JSON.stringify(normalized, null, 2)}\n`, "utf8");
-  await rename(tmpPath, databasePath);
-
-  cache = clone(normalized);
-  return clone(cache);
-}
-
-function enqueueWrite(task) {
-  const run = writeQueue.then(task, task);
-  writeQueue = run.catch(() => {});
-  return run;
-}
-
-export async function readDatabase() {
-  if (cache) {
-    return clone(cache);
-  }
-
+export async function initDatabase() {
   await mkdir(dataDir, { recursive: true });
 
-  if (!existsSync(databasePath)) {
-    return persistDatabase(seedData);
+  return new Promise((resolve, reject) => {
+    db = new sqlite3.Database(dbPath, (err) => {
+      if (err) {
+        return reject(err);
+      }
+
+      db.run('PRAGMA foreign_keys = ON');
+
+      db.serialize(() => {
+        db.run(`
+          CREATE TABLE IF NOT EXISTS app_state (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            state_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+          )
+        `);
+
+        db.run(`
+          CREATE TABLE IF NOT EXISTS uploaded_videos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_name TEXT NOT NULL,
+            original_name TEXT NOT NULL,
+            mime_type TEXT NOT NULL,
+            url TEXT NOT NULL,
+            created_at TEXT NOT NULL
+          )
+        `);
+
+        db.run(`
+          CREATE TABLE IF NOT EXISTS health_measurements (
+            id TEXT PRIMARY KEY,
+            date TEXT NOT NULL,
+            weight REAL NOT NULL,
+            waist REAL,
+            hips REAL,
+            arms REAL,
+            thighs REAL,
+            chest REAL,
+            timestamp TEXT NOT NULL
+          )
+        `);
+
+        resolve();
+      });
+    });
+  });
+}
+
+export function getAppState() {
+  return new Promise((resolve, reject) => {
+    db.get('SELECT state_json FROM app_state WHERE id = 1', (err, row) => {
+      if (err) return reject(err);
+      if (!row) return resolve(null);
+      try {
+        resolve(JSON.parse(row.state_json));
+      } catch (parseErr) {
+        reject(parseErr);
+      }
+    });
+  });
+}
+
+export function saveAppState(state) {
+  const jsonStr = JSON.stringify(state);
+  const updatedAt = new Date().toISOString();
+
+  return new Promise((resolve, reject) => {
+    db.run(
+      `INSERT INTO app_state (id, state_json, updated_at)
+       VALUES (1, ?, ?)
+       ON CONFLICT(id) DO UPDATE SET
+         state_json = excluded.state_json,
+         updated_at = excluded.updated_at`,
+      [jsonStr, updatedAt],
+      (err) => {
+        if (err) reject(err);
+        else resolve();
+      }
+    );
+  });
+}
+
+export function syncMeasurements(progressArray) {
+  if (!Array.isArray(progressArray) || progressArray.length === 0) {
+    return Promise.resolve();
   }
 
-  try {
-    const raw = await readFile(databasePath, "utf8");
-    cache = normalizeDatabase(JSON.parse(raw));
-    return clone(cache);
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return persistDatabase(seedData);
-    }
+  return new Promise((resolve, reject) => {
+    db.serialize(() => {
+      db.run('BEGIN TRANSACTION');
 
-    error.message = `Unable to read database at ${databasePath}: ${error.message}`;
-    throw error;
-  }
+      try {
+        const stmt = db.prepare(`
+          INSERT INTO health_measurements (id, date, weight, waist, hips, arms, thighs, chest, timestamp)
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            date = excluded.date,
+            weight = excluded.weight,
+            waist = excluded.waist,
+            hips = excluded.hips,
+            arms = excluded.arms,
+            thighs = excluded.thighs,
+            chest = excluded.chest,
+            timestamp = excluded.timestamp
+        `);
+
+        for (const entry of progressArray) {
+          const id = entry.id;
+          const date = entry.date;
+          const weight = parseFloat(entry.weight) || 0;
+          const waist = entry.waist && entry.waist !== '' ? parseFloat(entry.waist) : null;
+          const hips = entry.hips && entry.hips !== '' ? parseFloat(entry.hips) : null;
+          const arms = entry.arms && entry.arms !== '' ? parseFloat(entry.arms) : null;
+          const thighs = entry.thighs && entry.thighs !== '' ? parseFloat(entry.thighs) : null;
+          const chest = entry.chest && entry.chest !== '' ? parseFloat(entry.chest) : null;
+          const timestamp = entry.timestamp || new Date().toISOString();
+
+          stmt.run(id, date, weight, waist, hips, arms, thighs, chest, timestamp);
+        }
+
+        stmt.finalize();
+
+        db.run('COMMIT', (err) => {
+          if (err) reject(err);
+          else resolve();
+        });
+      } catch (err) {
+        db.run('ROLLBACK');
+        reject(err);
+      }
+    });
+  });
 }
 
-export async function ensureDatabase() {
-  return readDatabase();
-}
-
-export async function writeDatabase(value) {
-  return enqueueWrite(() => persistDatabase(value));
-}
-
-export async function updateDatabase(mutator) {
-  return enqueueWrite(async () => {
-    const current = await readDatabase();
-    const next = (await mutator(current)) || current;
-    return persistDatabase(next);
+export function saveUploadedVideo(fileName, originalName, mimeType, url) {
+  const createdAt = new Date().toISOString();
+  return new Promise((resolve, reject) => {
+    db.run(
+      `INSERT INTO uploaded_videos (file_name, original_name, mime_type, url, created_at)
+       VALUES (?, ?, ?, ?, ?)`,
+      [fileName, originalName, mimeType, url, createdAt],
+      function (err) {
+        if (err) reject(err);
+        else resolve(this.lastID);
+      }
+    );
   });
 }

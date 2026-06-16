@@ -131,9 +131,11 @@ const PORT = process.env.PORT || 4000;
 async function start() {
   try {
     await initDatabase();
-    app.listen(PORT, () => {
-      console.log(`FitJourney Server running on http://localhost:${PORT}`);
-    });
+    if (process.env.VERCEL !== '1') {
+      app.listen(PORT, () => {
+        console.log(`FitJourney Server running on http://localhost:${PORT}`);
+      });
+    }
   } catch (err) {
     console.error('Failed to start server:', err);
     process.exit(1);
@@ -141,3 +143,5 @@ async function start() {
 }
 
 start();
+
+export default app;

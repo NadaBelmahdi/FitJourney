@@ -52,6 +52,10 @@ app.use(express.json({ limit: '10mb' }));
 
 app.use('/uploads', express.static(uploadsDir));
 
+app.get("/health", (req, res) => {
+  res.status(200).send("OK");
+});
+
 app.get('/api/fitness', async (req, res) => {
   try {
     const state = await getAppState();
